@@ -1,6 +1,9 @@
 import argparse
 import re
 import pymupdf  # PyMuPDF
+import json
+import pandas as pd
+from pathlib import Path
 
 
 # -----------------------------
@@ -39,6 +42,7 @@ def dedup_preserve_order(items):
 
 
 # -----------------------------
+#
 # Text extraction utilities
 # -----------------------------
 def is_bold_span(span: dict) -> bool:
@@ -80,15 +84,27 @@ def extract_headers_from_bold(spans):
         if not buf:
             return
         joined = " ".join(buf).strip()
+
+        # Reject obvious labels / banners
         if joined.lower().startswith(REJECT_BOLD_PREFIXES):
             buf.clear()
             last_idx = None
             return
+
+        # Accept only if it looks like a header
         if CO_TAIL_RE.search(joined) or "(Co. No." in joined:
+            # 🚫 Skip if it's ONLY a Co. No. fragment
+            if joined.lower().startswith("(co. no"):
+                buf.clear()
+                last_idx = None
+                return
+
+            # Otherwise clean & save
             clean = CO_NO_RE.sub("", joined).strip()
             clean = re.sub(r"\s{2,}", " ", clean)
             if clean and len(clean) <= 120:
                 results.append((clean, last_idx))
+
         buf.clear()
         last_idx = None
 
@@ -168,15 +184,20 @@ def extract_management_stub(*args, **kwargs):
 # CLI / main
 # -----------------------------
 def main():
+
     parser = argparse.ArgumentParser(description="Extract company info (V3 clean version).")
     parser.add_argument("pdf_path", type=str, help="Path to PDF")
     parser.add_argument("--pages", nargs="+", type=int, help="Pages to parse (0-based)")
+    parser.add_argument("--export-json", action="store_true", help="Export results to JSON file")
+    parser.add_argument("--export-xlsx", action="store_true", help="Export results to Excel file")
     args = parser.parse_args()
 
     doc = pymupdf.open(args.pdf_path)
     print(f"Loaded {args.pdf_path} with {doc.page_count} pages.")
 
-    pages_to_check = args.pages if args.pages else [3]
+    all_records = []
+    pages_to_check = args.pages if args.pages else list(range(doc.page_count))
+
     for p in pages_to_check:
         if p < 0 or p >= doc.page_count:
             print(f"⚠️ Skipping page {p}")
@@ -191,18 +212,75 @@ def main():
         for name, block_text in blocks:
             phones, emails = extract_contacts_from_block(block_text)
             mgmt = extract_management_stub()
-            records.append({
+            record = {
                 "company": name,
                 "emails": emails,
                 "phones": phones,
                 "management": mgmt,
-            })
+            }
+            records.append(record)
+            all_records.append(record)
 
+        # Print page summary for inspection
         print(f"\n--- Page {p} ---")
         print("Companies:", [{"company": r["company"]} for r in records])
         print("Emails:", dedup_preserve_order([e for r in records for e in r["emails"]]))
         print("Phones:", dedup_preserve_order([ph for r in records for ph in r["phones"]]))
         print("Management:", dedup_preserve_order([m for r in records for m in r["management"]]))
+
+    # -----------------------------
+    # Export logic
+    # -----------------------------
+    base_path = Path(__file__).parent
+    if args.export_xlsx:
+        # Flatten lists into comma-joined strings
+        flat_records = []
+        for r in all_records:
+            flat_records.append({
+                "Company": r["company"],
+                "Email(s)": ", ".join(r["emails"]) if r["emails"] else "N/A",
+                "Telephone(s)": ", ".join(r["phones"]) if r["phones"] else "N/A",
+            })
+
+        df = pd.DataFrame(flat_records)
+
+        # Export with pandas
+        out_xlsx = base_path / "companies.xlsx"
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Companies", index=False)
+
+            # Grab the worksheet
+            ws = writer.sheets["Companies"]
+
+            # Freeze header row
+            ws.freeze_panes = "A2"
+
+            # Style header row (bold, center)
+            from openpyxl.styles import Font, Alignment
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            # Auto-fit column widths
+            for col in ws.columns:
+                max_length = 0
+                col_letter = col[0].column_letter
+                for cell in col:
+                    try:
+                        max_length = max(max_length, len(str(cell.value)))
+                    except Exception:
+                        pass
+                adjusted_width = (max_length + 2)
+                ws.column_dimensions[col_letter].width = adjusted_width
+
+            # Wrap text + align cells
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.alignment = Alignment(
+                        wrap_text=True, vertical="top", horizontal="left"
+                    )
+
+        print(f"✅ Excel exported to {out_xlsx}")
 
 
 if __name__ == "__main__":
